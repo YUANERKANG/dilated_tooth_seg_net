@@ -5,10 +5,8 @@ from os.path import join
 from pathlib import Path
 
 import numpy as np
-import pyfqmr
 import torch
 import trimesh
-from scipy import spatial
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
@@ -17,14 +15,37 @@ from utils.mesh_io import filter_files
 from utils.teeth_numbering import colors_to_label, fdi_to_label
 
 
-def process_mesh(mesh: trimesh, labels: torch.tensor = None):
-    mesh_faces = torch.from_numpy(mesh.faces.copy()).float()
-    mesh_triangles = torch.from_numpy(mesh.vertices[mesh.faces]).float()
-    mesh_face_normals = torch.from_numpy(mesh.face_normals.copy()).float()
-    mesh_vertices_normals = torch.from_numpy(mesh.vertex_normals[mesh.faces]).float()
+def process_mesh(samples: np.ndarray, face_index: np.ndarray, mesh: trimesh.Trimesh, labels: torch.tensor = None):
+    """
+    Process mesh by extracting features from sampled points and their corresponding face indices.
+    
+    Args:
+        samples: (N, 3) array of sampled points on the mesh surface
+        face_index: (N,) array of face indices corresponding to each sample
+        mesh: Original trimesh object
+        labels: (optional) label tensor for each sample
+    
+    Returns:
+        samples tensor, mesh triangles, vertex normals, face normals, labels
+    """
+    # Convert samples to tensor
+    samples_tensor = torch.from_numpy(samples.copy()).float()
+    
+    # Extract triangle vertices for each sampled point using face_index
+    mesh_triangles = torch.from_numpy(mesh.vertices[mesh.faces[face_index]]).float()
+    
+    # Extract vertex normals for each triangle
+    mesh_vertices_normals = torch.from_numpy(mesh.vertex_normals[mesh.faces[face_index]]).float()
+    
+    # Extract face normals for each sampled point
+    mesh_face_normals = torch.from_numpy(mesh.face_normals[face_index]).float()
+    
     if labels is None:
-        labels = torch.from_numpy(colors_to_label(mesh.visual.face_colors.copy())).long()
-    return mesh_faces, mesh_triangles, mesh_vertices_normals, mesh_face_normals, labels
+        # Extract labels from face colors using face_index
+        face_labels = colors_to_label(mesh.visual.face_colors.copy())
+        labels = torch.from_numpy(face_labels[face_index]).long()
+    
+    return samples_tensor, mesh_triangles, mesh_vertices_normals, mesh_face_normals, labels
 
 
 class Teeth3DSDataset(Dataset):
@@ -78,33 +99,35 @@ class Teeth3DSDataset(Dataset):
             return tqdm(data)
         return data
     
-    def _donwscale_mesh(self, mesh, labels):
-        mesh_simplifier = pyfqmr.Simplify()
-        mesh_simplifier.setMesh(mesh.vertices, mesh.faces)
-        mesh_simplifier.simplify_mesh(target_count=16000, aggressiveness=3, preserve_border=True, verbose=0,
-                                      max_iterations=2000)
-        new_positions, new_face, _ = mesh_simplifier.getMesh()
-        mesh_simple = trimesh.Trimesh(vertices=new_positions, faces=new_face)
-        vertices = mesh_simple.vertices
-        faces = mesh_simple.faces
-        if faces.shape[0] < 16000:
-            fs_diff = 16000 - faces.shape[0]
-            faces = np.append(faces, np.zeros((fs_diff, 3), dtype="int"), 0)
-        elif faces.shape[0] > 16000:
-            mesh_simple = trimesh.Trimesh(vertices=vertices, faces=faces)
-            samples, face_index = trimesh.sample.sample_surface_even(mesh_simple, 16000)
-            mesh_simple = trimesh.Trimesh(vertices=mesh_simple.vertices, faces=mesh_simple.faces[face_index])
-            faces = mesh_simple.faces
-            vertices = mesh_simple.vertices
-        mesh_simple = trimesh.Trimesh(vertices=vertices, faces=faces)
-
-        mesh_v_mean = mesh.vertices[mesh.faces].mean(axis=1)
-        mesh_simple_v = mesh_simple.vertices
-        tree = spatial.KDTree(mesh_v_mean)
-        query = mesh_simple_v[faces].mean(axis=1)
-        distance, index = tree.query(query)
-        labels = labels[index].flatten()
-        return mesh_simple, labels
+    def _sample_mesh(self, mesh, labels, target_count=16000):
+        """
+        Sample points uniformly from mesh surface using area-weighted probability.
+        
+        Args:
+            mesh: trimesh object
+            labels: per-face labels
+            target_count: number of points to sample (default: 16000)
+        
+        Returns:
+            samples: (N, 3) array of sampled points
+            face_index: (N,) array of face indices
+            labels: (N,) array of labels for each sample
+        """
+        # Sample uniformly from the mesh surface
+        samples, face_index = trimesh.sample.sample_surface(mesh, target_count)
+        
+        # If we got fewer samples than target, resample with replacement
+        if len(samples) < target_count:
+            # Resample to reach target count
+            additional_count = target_count - len(samples)
+            additional_samples, additional_face_index = trimesh.sample.sample_surface(mesh, additional_count)
+            samples = np.vstack([samples, additional_samples])
+            face_index = np.concatenate([face_index, additional_face_index])
+        
+        # Extract labels for sampled faces
+        sampled_labels = labels[face_index]
+        
+        return samples, face_index, sampled_labels
 
     def _iterate_mesh_and_labels(self):
         root_mesh_folder = join(self.root, self.raw_folder)
@@ -118,9 +141,9 @@ class Teeth3DSDataset(Dataset):
                     labels = labels[mesh.faces]
                     labels = labels[:, 0]
                     labels = fdi_to_label(labels)
-                    mesh, labels = self._donwscale_mesh(mesh, labels)
+                    samples, face_index, sampled_labels = self._sample_mesh(mesh, labels)
                     fn = file.replace('.obj', '')
-                    yield mesh, labels, fn
+                    yield samples, face_index, mesh, sampled_labels, fn
 
     def _is_processed(self):
         files_processed = filter_files(join(self.root, self.processed_folder), 'pt')
@@ -131,9 +154,11 @@ class Teeth3DSDataset(Dataset):
         self._log('Processing data')
         for f in filter_files(join(self.root, self.processed_folder), 'pt'):
             os.remove(join(self.root, self.processed_folder, f))
-        for mesh, labels, fn in self._loop(self._iterate_mesh_and_labels()):
-            mesh = self.move_to_origin(mesh)
-            data = process_mesh(mesh, torch.from_numpy(labels).long())
+        for samples, face_index, mesh, labels, fn in self._loop(self._iterate_mesh_and_labels()):
+            # Center the samples and shift the original mesh
+            samples, mesh = self.move_to_origin(samples, mesh)
+            # Process mesh to extract features
+            data = process_mesh(samples, face_index, mesh, torch.from_numpy(labels).long())
             if self.pre_transform is not None:
                 data = self.pre_transform(data)
             with open(f'{join(self.root, self.processed_folder)}/data_{fn}.pt', 'wb') as f:
