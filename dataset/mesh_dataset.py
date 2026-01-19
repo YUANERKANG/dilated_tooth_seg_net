@@ -116,9 +116,9 @@ class Teeth3DSDataset(Dataset):
         # Sample uniformly from the mesh surface
         samples, face_index = trimesh.sample.sample_surface(mesh, target_count)
         
-        # If we got fewer samples than target, resample with replacement
+        # If we got fewer samples than target, sample additional points to reach target
         if len(samples) < target_count:
-            # Resample to reach target count
+            # Sample additional points to reach target count
             additional_count = target_count - len(samples)
             additional_samples, additional_face_index = trimesh.sample.sample_surface(mesh, additional_count)
             samples = np.vstack([samples, additional_samples])
